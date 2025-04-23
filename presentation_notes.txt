@@ -1,0 +1,129 @@
+Title Slide: Hierarchical Ensemble Model for Cy Young Prediction
+---------------------------------------------------------------
+• Welcome everyone—I’m Charles Benfer, and today I’ll walk you through a three‑level ensemble pipeline to forecast the Cy Young award.  
+• We combine the finest granularity (individual pitches), temporal patterns (game sequences), and season‑long context (hierarchical effects) into a single meta‑model.  
+• By the end, you’ll see how we train on historical data and deploy the same pipeline in near‑real time for the current season.
+
+Outline
+-------
+• Here’s the roadmap for today:
+  1. Motivation – why this problem matters  
+  2. Data Collection – sources, scraping, and preparation  
+  3. Level 1: Pitch‑Level Modeling – building per‑pitch scores via conditional ensembles  
+  4. Level 2: Game‑Level Sequence Modeling – an LSTM on 5‑game windows  
+  5. Level 3: Bayesian Hierarchical Modeling – pooling season effects  
+  6. Meta‑Model Stacking – combining the three levels into one prediction  
+  7. Current Season Prediction – how we update the pipeline live  
+  8. Conclusion & Future Work – summary and next steps  
+
+Motivation / Cy Young Award
+---------------------------
+• The Cy Young is baseball’s premier pitching honor, awarded annually to one pitcher in each league.  
+• Voted by the Baseball Writers’ Association of America, it reflects both traditional stats (wins, ERA) and advanced metrics (FIP, WAR).  
+• Financial and reputational stakes are high: correctly forecasting drives analytics credibility, front‑office decisions, and even contract negotiations.  
+• Our challenge: can we predict a subjective voting outcome using strictly on‑field performance data?  
+
+Data Collection
+---------------
+• **Pitch‑level data**: Statcast via TJ Nestico’s scraper + Pybaseball — yields ~80 raw features per pitch (velocity, spin, location).  
+• **Game‑level data**: aggregate pitch scores into per‑game means (and pull RBI, other summary stats).  
+• **Season‑level data**: award finish position & winner flags from Pybaseball’s voting tables.  
+• **Key steps**: handle API rate limits, normalize player names for consistent joins, filter to top‑10 finishers for training.  
+• **Cleaning**: remove NA’s, encode categorical (pitch type, handedness), scale numericals.  
+
+Level 1: Pitch‑Level Ensemble
+-----------------------------
+• **Why conditional?** Swing → Whiff → Exit velocity reflects the batting process: batter chooses, may miss, then if contact—quality of contact.  
+• **Models** (all Random Forests, hyper‑tuned via RandomizedSearchCV):  
+  1. **Swing classifier** predicts P(swing) using pitch speed, spin, location, pitch type, handedness.  
+  2. **Whiff classifier** predicts P(whiff | swing) on those same features but only on swinging events.  
+  3. **Exit velocity regressor** predicts E(launch_speed | swing & !whiff) on contact events.  
+• **Final pitch score**:  
+  \[
+    \text{score} = P(\text{swing}) \times \bigl(1 - P(\text{whiff} \mid \text{swing})\bigr) \times E(\text{exit\_vel}).
+  \]  
+• **Metrics**: Swing AUC ≈ 0.875, Whiff AUC ≈ 0.740, ExitVel MSE ≈ 196 (R² ≈ 0.09).  
+
+Level 2: Game‑Level Sequence Modeling
+-------------------------------------
+• **Input**: for each pitcher–season, create a rolling window of 5 consecutive games.  
+• **Feature**: per‐game mean pitch_score.  
+• **LSTM architecture**:  
+  - Masking layer (to ignore padding)  
+  - LSTM(32 units)  
+  - Dense(1) output for next‐game RBI_mean  
+• **Hyperparameters tuned** by Keras Tuner RandomSearch over `{units, dropout, learning rate}`.  
+• **Loss**: mean squared error; we hold out 20% of windows for validation.  
+• **Result**: validation MSE ~ 0.0094 (normalized scale).  
+
+Level 3: Bayesian Hierarchical Modeling
+---------------------------------------
+• We treat each pitcher–season as a group effect on game‐level RBI predictions from the LSTM.  
+• **Model specification**:
+  1. **Group-level (season) effects**  
+     For each pitcher \(i\), a latent effect \(a_i\) represents their typical RBI ability that season.  
+     \[
+       a_i \;\sim\; \mathcal{N}(\mu,\,\sigma^2)
+     \]
+     where \(\mu\) is the overall mean ability and \(\sigma\) is the between‑pitcher standard deviation.
+  2. **Observation model**  
+     Each predicted RBI \(y_{ij}\) for game \(j\) of pitcher \(i\) is noisy around \(a_i\):
+     \[
+       y_{ij} \;\sim\; \mathcal{N}(a_i,\,\epsilon^2)
+     \]
+     with \(\epsilon\) capturing game‑to‑game variability (luck, lineup, weather).
+  3. **Hyperpriors**  
+     - \(\mu \sim \mathcal{N}(0,1)\)  
+     - \(\sigma \sim \mathrm{HalfNormal}(1)\)  
+     - \(\epsilon \sim \mathrm{HalfCauchy}(1)\)  
+     These weakly‐informative priors stabilize estimation without overwhelming the data.
+  4. **Inference**  
+     - We run PyMC’s NUTS sampler to draw from the joint posterior  
+       \(\,p(\{a_i\},\mu,\sigma,\epsilon \mid \{y_{ij}\})\).  
+     - We summarize each pitcher’s posterior \(a_i\) by its mean (or median).  
+     - That posterior‐mean becomes our **Bayesian effect** feature for Level 3.
+• **Why hierarchical?**  
+  - Partial pooling: pitchers with few games or noisy predictions shrink toward the global mean, while well‑sampled pitchers move farther away.  
+  - Better out‐of‐sample stability than separate or complete pooling.  
+  - Provides uncertainty quantification (posterior credible intervals) if desired.  
+
+Meta‑Model Stacking
+-------------------
+• Build a season‐level table, one row per pitcher–season, with:  
+  - \(L_1\): season average pitch_score_mean  
+  - \(L_2\): season average rbi_pred_mean  
+  - \(L_3\): bayesian effect \(a_i\)  
+  - Label: winner_flag (1 if won, 0 otherwise)  
+• **Pipeline**:  
+  1. Impute missing with mean  
+  2. Standard scale  
+  3. Logistic regression, \(C\) tuned via GridSearchCV  
+• **Training performance**: Accuracy ≈ 0.93, AUC ≈ 0.62.  
+
+Training Results
+----------------
+**Level 1 Metrics**  
+• Swing classifier: Acc ≈ 0.796, AUC ≈ 0.875  
+• Whiff classifier: Acc ≈ 0.761, AUC ≈ 0.740  
+• Exit‐vel regressor: MSE ≈ 196.46, R² ≈ 0.092  
+
+**Level 2 & Meta Metrics**  
+• LSTM next‐game RBI: val MSE ≈ 0.0094  
+• Meta logistic: Acc ≈ 0.929, AUC ≈ 0.618  
+
+Current Season Prediction
+-------------------------
+1. Scrape current‑season pitch events via scraper + Pybaseball  
+2. Compute pitch_scores with Level 1 ensemble  
+3. Aggregate per‑game and predict next‑game RBIs via trained LSTM  
+4. Map Bayesian effects (or global mean for new pitchers)  
+5. Assemble meta‑features \([L_1, L_2, L_3]\) and predict Cy Young probabilities  
+6. Rank by probability to identify frontrunners  
+
+Conclusion & Future Work
+------------------------
+• Built a modular, interpretable 3‑level ensemble combining events, time series, and hierarchical effects.  
+• **Future enhancements**:  
+  - Add contextual features (win probability, defensive support)  
+  - Real‑time updating as each game finishes  
+  - Expand meta‑model with off‑field factors (contracts, market dynamics)  
