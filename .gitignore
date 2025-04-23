@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+lstm_tuning
+
+br_cache.sqlite
