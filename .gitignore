@@ -177,3 +177,5 @@ cython_debug/
 lstm_tuning
 
 br_cache.sqlite
+
+data/
