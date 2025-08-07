@@ -1,0 +1,5 @@
+feature,coefficient,abs_coefficient
+pitch_rbi_interaction,-0.6311579536180772,0.6311579536180772
+bayes_effect,-0.5634230732898269,0.5634230732898269
+rbi_pred_mean,-0.12326449697974064,0.12326449697974064
+pitch_score_mean,0.0,0.0

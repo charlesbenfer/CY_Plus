@@ -1,0 +1,2 @@
+swing_accuracy,swing_auc,whiff_accuracy,whiff_auc,exit_velocity_r2,exit_velocity_mse,exit_velocity_mae,n_features_used,n_total_samples,n_swings,n_contact_events
+0.794644204933128,0.8762368076321565,0.7623011928429424,0.7421737886361053,0.09925965982906348,195.70002569835924,10.897203022987304,14,165614,80476,27331

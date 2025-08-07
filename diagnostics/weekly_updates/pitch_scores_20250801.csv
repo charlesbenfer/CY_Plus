@@ -1,0 +1,2 @@
+update_date,total_pitches,feature_completeness,swing_prob_mean,swing_prob_std,whiff_prob_mean,whiff_prob_std,exit_velo_mean,exit_velo_std,pitch_score_mean,pitch_score_std,pitch_score_zeros,pitch_score_zeros_pct
+20250801,123317,0.9950290714175661,0.4404668847491721,0.17732470049294277,0.28634008279521383,0.13595749341228366,86.94923392165924,4.2584728371679414,16.282772003846322,19.051316913294855,63863,51.78766917781004

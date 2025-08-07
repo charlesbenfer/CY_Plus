@@ -1,0 +1,9 @@
+mean_test_score,std_test_score,params
+,,"{'clf__C': 1.0, 'clf__penalty': 'l1'}"
+,,"{'clf__C': 1.0, 'clf__penalty': 'l2'}"
+,,"{'clf__C': 10.0, 'clf__penalty': 'l1'}"
+,,"{'clf__C': 10.0, 'clf__penalty': 'l2'}"
+,,"{'clf__C': 100.0, 'clf__penalty': 'l1'}"
+,,"{'clf__C': 100.0, 'clf__penalty': 'l2'}"
+,,"{'clf__C': 1000.0, 'clf__penalty': 'l1'}"
+,,"{'clf__C': 1000.0, 'clf__penalty': 'l2'}"

@@ -1,0 +1,2 @@
+update_date,n_observations,n_pitchers,n_new_pitchers,n_missing_pitchers,max_rhat,min_ess_bulk,convergence_ok,global_mean,between_pitcher_sd,within_pitcher_sd,effects_range,metric_mean,metric_std
+20250801,1040,62,50,24,,,False,-0.03270529841011789,0.48644264708587115,1.7981747969036465e-09,1.7326730136193422,0.09935486316680908,1.7913505123701157e-09

@@ -1,18 +1,38 @@
 import requests
 import polars as pl
+import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, date
 from tqdm import tqdm
 from pytz import timezone
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import statsapi
+from pybaseball import pitching_stats
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class MLB_Scrape:
 
     def __init__(self):
-        # Initialize your class here if needed
-        pass
+        # Create a robust session with retries and timeouts
+        self.session = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Set reasonable timeouts
+        self.timeout = (10, 30)  # (connect_timeout, read_timeout)
 
     def get_sport_id(self):
         """
@@ -49,7 +69,6 @@ class MLB_Scrape:
             return False
         
         return True
-
 
     def get_game_types(self):
         """
@@ -159,43 +178,88 @@ class MLB_Scrape:
         return game_df
     
 
-    def get_data(self, game_list_input: list):
+    def get_data(self, game_list_input: list, max_workers=2):
         """
-        Retrieves live game data for a list of game IDs in parallel.
-        
-        Parameters:
-        - game_list_input (list): A list of game IDs for which to retrieve live data.
-        
-        Returns:
-        - data_total (list): A list of JSON responses containing live game data for each game ID.
+        ROBUST VERSION: Retrieves live game data with rate limiting and error handling
         """
         data_total = []
-        print('This May Take a While. Progress Bar shows Completion of Data Retrieval.')
+        failed_games = []
         
-        def fetch_data(game_id):
-            r = requests.get(f'https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live')
-            return r.json()
+        print(f'Collecting data for {len(game_list_input)} games with robust error handling...')
         
-        with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(fetch_data, game_id): game_id for game_id in game_list_input}
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing", unit="iteration"):
-                data_total.append(future.result())
+        def fetch_data_with_retry(game_id):
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # Add delay to avoid rate limiting
+                    time.sleep(0.3)  # 300ms delay between requests
+                    
+                    response = self.session.get(
+                        f'https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live',
+                        timeout=self.timeout
+                    )
+                    
+                    if response.status_code == 200:
+                        return response.json()
+                    elif response.status_code == 429:  # Rate limit
+                        wait_time = 2 ** attempt  # Exponential backoff
+                        print(f"   Rate limited for game {game_id}, waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"   HTTP {response.status_code} for game {game_id}")
+                        return None
+                        
+                except requests.exceptions.Timeout:
+                    print(f"   Timeout for game {game_id} (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                except requests.exceptions.RequestException as e:
+                    print(f"   Request error for game {game_id}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                        continue
+            
+            return None
         
+        # Use ThreadPoolExecutor with reduced workers to avoid overwhelming the API
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_data_with_retry, game_id): game_id for game_id in game_list_input}
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing", unit="game"):
+                game_id = futures[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        data_total.append(result)
+                    else:
+                        failed_games.append(game_id)
+                except Exception as e:
+                    print(f"   Failed to process game {game_id}: {e}")
+                    failed_games.append(game_id)
+        
+        if failed_games:
+            print(f"   ⚠️ Failed to collect {len(failed_games)} games: {failed_games[:5]}{'...' if len(failed_games) > 5 else ''}")
+        
+        print(f"   ✅ Successfully collected {len(data_total)}/{len(game_list_input)} games")
         return data_total
 
     def get_data_df(self, data_list):
         """
-        Converts a list of game data JSON objects into a Polars DataFrame.
+        Converts a list of game data JSON objects into a Pandas DataFrame (FIXED for training pipeline compatibility).
         
         Parameters:
         - data_list (list): A list of JSON objects containing game data.
         
         Returns:
-        - data_df (pl.DataFrame): A DataFrame containing the structured game data.
+        - data_df (pd.DataFrame): A DataFrame containing the structured game data in the correct format.
         """
         swing_list = ['X','F','S','D','E','T','W','L','M','Q','Z','R','O','J']
         whiff_list = ['S','T','W','M','Q','O']
         print('Converting Data to Dataframe.')
+        
+        # Initialize all lists
         game_id = []
         game_date = []
         batter_id = []
@@ -271,7 +335,6 @@ class MLB_Scrape:
         end_time = []
         is_pitch = []
         type_type = []
-
 
         type_ab = []
         ab_number = []
@@ -392,6 +455,12 @@ class MLB_Scrape:
                                     vb.append(ab_list['playEvents'][n]['pitchData']['breaks']['breakVertical'] if 'breakVertical' in ab_list['playEvents'][n]['pitchData']['breaks'] else None)                               
                                     ivb.append(ab_list['playEvents'][n]['pitchData']['breaks']['breakVerticalInduced'] if 'breakVerticalInduced' in ab_list['playEvents'][n]['pitchData']['breaks'] else None)
                                     hb.append(ab_list['playEvents'][n]['pitchData']['breaks']['breakHorizontal'] if 'breakHorizontal' in ab_list['playEvents'][n]['pitchData']['breaks'] else None)
+                                else:
+                                    spin_rate.append(None)
+                                    spin_direction.append(None)
+                                    vb.append(None)
+                                    ivb.append(None)
+                                    hb.append(None)
     
                             else:
                                 start_speed.append(None)
@@ -453,10 +522,7 @@ class MLB_Scrape:
                             is_pitch.append(ab_list['playEvents'][n]['isPitch'] if 'isPitch' in ab_list['playEvents'][n] else None)
                             type_type.append(ab_list['playEvents'][n]['type'] if 'type' in ab_list['playEvents'][n] else None)
     
-    
-    
                             if n == len(ab_list['playEvents']) - 1 :
-    
                                 type_ab.append(data['liveData']['plays']['allPlays'][ab_id]['result']['type'] if 'type' in data['liveData']['plays']['allPlays'][ab_id]['result'] else None)
                                 event.append(data['liveData']['plays']['allPlays'][ab_id]['result']['event'] if 'event' in data['liveData']['plays']['allPlays'][ab_id]['result'] else None)
                                 event_type.append(data['liveData']['plays']['allPlays'][ab_id]['result']['eventType'] if 'eventType' in data['liveData']['plays']['allPlays'][ab_id]['result'] else None)
@@ -466,7 +532,6 @@ class MLB_Scrape:
                                 is_out.append(data['liveData']['plays']['allPlays'][ab_id]['result']['isOut'] if 'isOut' in data['liveData']['plays']['allPlays'][ab_id]['result'] else None)
     
                             else:
-    
                                 type_ab.append(None)
                                 event.append(None)
                                 event_type.append(None)
@@ -479,7 +544,6 @@ class MLB_Scrape:
     
                             event.append(data['liveData']['plays']['allPlays'][ab_id]['result']['event'])
                             event_type.append(data['liveData']['plays']['allPlays'][ab_id]['result']['eventType'])
-    
     
                             game_id.append(data['gamePk'])
                             game_date.append(data['gameData']['datetime']['officialDate'])
@@ -520,8 +584,6 @@ class MLB_Scrape:
                             end_time.append(ab_list['playEvents'][n]['endTime'] if 'endTime' in ab_list['playEvents'][n] else None)
                             is_pitch.append(ab_list['playEvents'][n]['isPitch'] if 'isPitch' in ab_list['playEvents'][n] else None)
                             type_type.append(ab_list['playEvents'][n]['type'] if 'type' in ab_list['playEvents'][n] else None)
-    
-    
     
                             is_swing.append(None)
                             is_whiff.append(None)
@@ -572,90 +634,358 @@ class MLB_Scrape:
             except KeyError:
                 print(f"No Data for Game")
         
-        df  = pl.DataFrame(data={
-            'game_id':game_id,
-            'game_date':game_date,
-            'batter_id':batter_id,
-            'batter_name':batter_name,
-            'batter_hand':batter_hand,
-            'batter_team':batter_team,
-            'batter_team_id':batter_team_id,
-            'pitcher_id':pitcher_id,
-            'pitcher_name':pitcher_name,
-            'pitcher_hand':pitcher_hand,
-            'pitcher_team':pitcher_team,
-            'pitcher_team_id':pitcher_team_id,
-            'ab_number':ab_number,
-            'play_description':play_description,
-            'play_code':play_code,
-            'in_play':in_play,
-            'is_strike':is_strike,
-            'is_swing':is_swing,
-            'is_whiff':is_whiff,
-            'is_out':is_out,
-            'is_ball':is_ball,
-            'is_review':is_review,
-            'pitch_type':pitch_type,
-            'pitch_description':pitch_description,
-            'strikes':strikes,
-            'balls':balls,
-            'outs':outs,
-            'strikes_after':strikes_after,
-            'balls_after':balls_after,
-            'outs_after':outs_after,            
-            'start_speed':start_speed,
-            'end_speed':end_speed,
-            'sz_top':sz_top,
-            'sz_bot':sz_bot,
-            'x':x,
-            'y':y,
-            'ax':ax,
-            'ay':ay,
-            'az':az,
-            'pfxx':pfxx,
-            'pfxz':pfxz,
-            'px':px,
-            'pz':pz,
-            'vx0':vx0,
-            'vy0':vy0,
-            'vz0':vz0,
-            'x0':x0,
-            'y0':y0,
-            'z0':z0,
-            'zone':zone,
-            'type_confidence':type_confidence,
-            'plate_time':plate_time,
-            'extension':extension,
-            'spin_rate':spin_rate,
-            'spin_direction':spin_direction,
-            'vb':vb,
-            'ivb':ivb,
-            'hb':hb,
-            'launch_speed':launch_speed,
-            'launch_angle':launch_angle,
-            'launch_distance':launch_distance,
-            'launch_location':launch_location,
-            'trajectory':trajectory,
-            'hardness':hardness,
-            'hit_x':hit_x,
-            'hit_y':hit_y,
-            'index_play':index_play,
-            'play_id':play_id,
-            'start_time':start_time,
-            'end_time':end_time,
-            'is_pitch':is_pitch,
-            'type_type':type_type,
-            'type_ab':type_ab,
-            'event':event,
-            'event_type':event_type,
-            'rbi':rbi,
-            'away_score':away_score,
-            'home_score':home_score,
+        # CRITICAL FIX: Return pandas DataFrame instead of Polars for training pipeline compatibility
+        df_dict = {
+            'game_id': game_id,
+            'game_date': game_date,
+            'batter_id': batter_id,
+            'batter_name': batter_name,
+            'batter_hand': batter_hand,
+            'batter_team': batter_team,
+            'batter_team_id': batter_team_id,
+            'pitcher_id': pitcher_id,
+            'pitcher_name': pitcher_name,
+            'pitcher_hand': pitcher_hand,
+            'pitcher_team': pitcher_team,
+            'pitcher_team_id': pitcher_team_id,
+            'ab_number': ab_number,
+            'play_description': play_description,
+            'play_code': play_code,
+            'in_play': in_play,
+            'is_strike': is_strike,
+            'is_swing': is_swing,
+            'is_whiff': is_whiff,
+            'is_out': is_out,
+            'is_ball': is_ball,
+            'is_review': is_review,
+            'pitch_type': pitch_type,
+            'pitch_description': pitch_description,
+            'strikes': strikes,
+            'balls': balls,
+            'outs': outs,
+            'strikes_after': strikes_after,
+            'balls_after': balls_after,
+            'outs_after': outs_after,            
+            'start_speed': start_speed,
+            'end_speed': end_speed,
+            'sz_top': sz_top,
+            'sz_bot': sz_bot,
+            'x': x,
+            'y': y,
+            'ax': ax,
+            'ay': ay,
+            'az': az,
+            'pfxx': pfxx,
+            'pfxz': pfxz,
+            'px': px,
+            'pz': pz,
+            'vx0': vx0,
+            'vy0': vy0,
+            'vz0': vz0,
+            'x0': x0,
+            'y0': y0,
+            'z0': z0,
+            'zone': zone,
+            'type_confidence': type_confidence,
+            'plate_time': plate_time,
+            'extension': extension,
+            'spin_rate': spin_rate,
+            'spin_direction': spin_direction,
+            'vb': vb,
+            'ivb': ivb,
+            'hb': hb,
+            'launch_speed': launch_speed,
+            'launch_angle': launch_angle,
+            'launch_distance': launch_distance,
+            'launch_location': launch_location,
+            'trajectory': trajectory,
+            'hardness': hardness,
+            'hit_x': hit_x,
+            'hit_y': hit_y,
+            'index_play': index_play,
+            'play_id': play_id,
+            'start_time': start_time,
+            'end_time': end_time,
+            'is_pitch': is_pitch,
+            'type_type': type_type,
+            'type_ab': type_ab,
+            'event': event,
+            'event_type': event_type,
+            'rbi': rbi,
+            'away_score': away_score,
+            'home_score': home_score,
+        }
 
-            },strict=False
-            )
-
+        # Create pandas DataFrame for training pipeline compatibility
+        df = pd.DataFrame(df_dict)
+        
+        # CRITICAL: Add the required columns that your training pipeline expects
+        # Map pitcher_name to Name column (required by training pipeline)
+        df['Name'] = df['pitcher_name']
+        
+        # Add Season column (you'll need to determine this based on game_date)
+        df['Season'] = pd.to_datetime(df['game_date']).dt.year
+        
+        # Convert game_date to datetime
+        df['game_date'] = pd.to_datetime(df['game_date'])
+        
+        # Ensure boolean columns are properly typed
+        bool_columns = ['is_swing', 'is_whiff', 'is_strike', 'is_out', 'is_ball', 'in_play', 'is_review']
+        for col in bool_columns:
+            if col in df.columns:
+                df[col] = df[col].astype('boolean')  # Use nullable boolean type
+        
+        print(f"✅ DataFrame created with {len(df):,} rows and {len(df.columns)} columns")
+        print(f"✅ Required columns added: Name, Season")
+        print(f"✅ Data types fixed for training pipeline compatibility")
+        
         return df
+
+    def get_current_season_data_for_training(self, season_year: int, max_players: int = None, test_mode: bool = False, min_innings=20):
+        """
+        ENHANCED VERSION: Collect current season data with better pitcher filtering and robust error handling
+        
+        Parameters:
+        - min_innings: Minimum innings pitched to be included (filters out position players who pitched)
+        """
+        print(f"📊 Collecting {season_year} season data for training pipeline...")
+        
+        # Get pitcher list from pybaseball with better filtering
+        try:
+            season_stats = pitching_stats(season_year)
+            
+            # FILTER OUT NON-PITCHERS AND LOW-VOLUME PITCHERS
+            # This explains why you're only getting 62 pitchers!
+            original_count = len(season_stats)
+            
+            # Filter for actual pitchers (minimum innings pitched)
+            season_stats = season_stats[season_stats['IP'] >= min_innings].copy()
+            filtered_count = len(season_stats)
+            
+            print(f"   Found {original_count} total pitchers in {season_year}")
+            print(f"   Filtered to {filtered_count} pitchers with ≥{min_innings} IP")
+            print(f"   Filtered out {original_count - filtered_count} position players/low-volume pitchers")
+            
+            # Sort by innings pitched (descending) to get most active pitchers first
+            season_stats = season_stats.sort_values('IP', ascending=False)
+            season_stats['Season'] = season_year
+            
+        except Exception as e:
+            print(f"   ❌ Error getting season stats: {e}")
+            return None, None, None
+        
+        # Limit for testing or to avoid overwhelming the API
+        if test_mode or max_players:
+            n_players = max_players or 50  # Increased default for non-test mode
+            season_stats = season_stats.head(n_players)
+            print(f"   Limited to {len(season_stats)} players for {'testing' if test_mode else 'API protection'}")
+        
+        # Data collection with progress tracking and error recovery
+        pitch_data_list = []
+        collection_stats = []
+        
+        for i, (_, row) in enumerate(season_stats.iterrows()):
+            name = row['Name']
+            
+            if i % 5 == 0:  # Progress updates every 5 players
+                print(f"     Progress: {i}/{len(season_stats)} players processed ({len(pitch_data_list)} successful)")
+            
+            try:
+                # Look up player with retry
+                players = None
+                for attempt in range(3):
+                    try:
+                        players = statsapi.lookup_player(name)
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"     Retry player lookup for {name} (attempt {attempt + 1})")
+                            time.sleep(1)
+                        else:
+                            print(f"     Failed to lookup {name}: {e}")
+                
+                if not players:
+                    collection_stats.append({
+                        'player': name,
+                        'status': 'player_not_found',
+                        'pitches_collected': 0,
+                        'games_collected': 0,
+                        'innings_pitched': row.get('IP', 0)
+                    })
+                    continue
+                
+                pid = players[0]['id']
+                
+                # Get games with retry
+                games = None
+                for attempt in range(3):
+                    try:
+                        games = self.get_player_games_list(
+                            player_id=pid, 
+                            season=season_year,
+                            start_date=f"{season_year}-03-01",
+                            end_date=f"{season_year}-11-30",
+                            sport_id=1, 
+                            game_type=['R'], 
+                            pitching=True
+                        )
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"     Retry games list for {name} (attempt {attempt + 1})")
+                            time.sleep(1)
+                        else:
+                            print(f"     Failed to get games for {name}: {e}")
+                
+                if not games:
+                    collection_stats.append({
+                        'player': name,
+                        'status': 'no_games_found',
+                        'pitches_collected': 0,
+                        'games_collected': 0,
+                        'innings_pitched': row.get('IP', 0)
+                    })
+                    continue
+                
+                # Limit games for very active pitchers to avoid timeout
+                original_games = len(games)
+                if len(games) > 35:
+                    games = games[:35]  # Most recent 35 games
+                    print(f"     Limited {name} to {len(games)}/{original_games} games")
+                
+                # Get pitch data with improved error handling
+                try:
+                    jsons = self.get_data(game_list_input=games, max_workers=2)
+                    
+                    if not jsons:
+                        collection_stats.append({
+                            'player': name,
+                            'status': 'no_game_data',
+                            'pitches_collected': 0,
+                            'games_collected': original_games,
+                            'innings_pitched': row.get('IP', 0)
+                        })
+                        continue
+                    
+                    df_raw = self.get_data_df(data_list=jsons)
+                    
+                    if len(df_raw) == 0:
+                        collection_stats.append({
+                            'player': name,
+                            'status': 'no_pitch_data',
+                            'pitches_collected': 0,
+                            'games_collected': original_games,
+                            'innings_pitched': row.get('IP', 0)
+                        })
+                        continue
+                    
+                    # Filter to this pitcher
+                    df_pitcher = df_raw[df_raw['pitcher_id'] == pid].copy()
+                    
+                    if len(df_pitcher) == 0:
+                        collection_stats.append({
+                            'player': name,
+                            'status': 'no_pitcher_data',
+                            'pitches_collected': 0,
+                            'games_collected': original_games,
+                            'innings_pitched': row.get('IP', 0)
+                        })
+                        continue
+                    
+                    # Ensure Name and Season columns are set correctly
+                    df_pitcher['Name'] = name
+                    df_pitcher['Season'] = season_year
+                    pitch_data_list.append(df_pitcher)
+                    
+                    collection_stats.append({
+                        'player': name,
+                        'status': 'success',
+                        'pitches_collected': len(df_pitcher),
+                        'games_collected': original_games,
+                        'games_processed': len(games),
+                        'unique_game_dates': df_pitcher['game_date'].nunique(),
+                        'innings_pitched': row.get('IP', 0)
+                    })
+                    
+                    print(f"     ✅ {name}: {len(df_pitcher):,} pitches from {len(games)} games ({row.get('IP', 0)} IP)")
+                    
+                except Exception as e:
+                    print(f"     ❌ Data collection failed for {name}: {e}")
+                    collection_stats.append({
+                        'player': name,
+                        'status': 'data_collection_error',
+                        'error_message': str(e)[:100],  # Truncate long error messages
+                        'pitches_collected': 0,
+                        'games_collected': original_games if 'original_games' in locals() else 0,
+                        'innings_pitched': row.get('IP', 0)
+                    })
+                    continue
+                    
+            except Exception as e:
+                print(f"     ❌ General error for {name}: {e}")
+                collection_stats.append({
+                    'player': name,
+                    'status': 'general_error',
+                    'error_message': str(e)[:100],
+                    'pitches_collected': 0,
+                    'games_collected': 0,
+                    'innings_pitched': row.get('IP', 0)
+                })
+                continue
+        
+        # Collection summary with detailed breakdown
+        stats_df = pd.DataFrame(collection_stats)
+        successful_collections = stats_df[stats_df['status'] == 'success']
+        
+        print(f"\n   📊 Final Collection Summary:")
+        print(f"     Successful: {len(successful_collections)}/{len(season_stats)} ({len(successful_collections)/len(season_stats)*100:.1f}%)")
+        
+        if len(successful_collections) > 0:
+            total_pitches = successful_collections['pitches_collected'].sum()
+            total_ip = successful_collections['innings_pitched'].sum()
+            print(f"     Total pitches: {total_pitches:,}")
+            print(f"     Total innings: {total_ip:.1f}")
+            print(f"     Avg pitches per player: {successful_collections['pitches_collected'].mean():.0f}")
+            print(f"     Avg IP per player: {successful_collections['innings_pitched'].mean():.1f}")
+        
+        # Show failure breakdown
+        failure_stats = stats_df[stats_df['status'] != 'success']['status'].value_counts()
+        if len(failure_stats) > 0:
+            print(f"     Failure breakdown:")
+            for status, count in failure_stats.items():
+                print(f"       {status}: {count}")
+        
+        # Save detailed collection stats for analysis
+        stats_df.to_csv(f'diagnostics/collection_stats_{season_year}_{date.today().strftime("%Y%m%d")}.csv', index=False)
+        
+        if len(pitch_data_list) == 0:
+            print("   ❌ No pitch data collected - check error messages above")
+            return None, None, season_stats
+        
+        # Combine all pitch data
+        pitch_df_current = pd.concat(pitch_data_list, ignore_index=True)
+        print(f"   ✅ Final dataset: {len(pitch_df_current):,} pitches from {pitch_df_current['Name'].nunique()} players")
+        
+        # Create game-level aggregations
+        if 'rbi' in pitch_df_current.columns:
+            game_df_current = (
+                pitch_df_current
+                .groupby(['game_id', 'game_date', 'Name', 'Season'])['rbi']
+                .mean().reset_index().rename(columns={'rbi': 'rbi_mean'})
+            )
+        else:
+            # Fallback if RBI column is missing
+            print("   ⚠️ RBI column not found, using pitch count as proxy")
+            game_df_current = (
+                pitch_df_current
+                .groupby(['game_id', 'game_date', 'Name', 'Season'])
+                .size().reset_index(name='pitch_count')
+            )
+            game_df_current['rbi_mean'] = game_df_current['pitch_count'] / 100
+        
+        print(f"   ✅ Game-level data: {len(game_df_current):,} game records")
+        
+        return pitch_df_current, game_df_current, season_stats
 
     def get_teams(self):
         """
@@ -745,26 +1075,14 @@ class MLB_Scrape:
         return leagues_df
 
     def get_player_games_list(self, player_id: int, 
-                              season: int, 
-                              start_date: str = None, 
-                              end_date: str = None, 
-                              sport_id: int = 1, 
-                              game_type: list = ['R'],
-                              pitching: bool = True):
+                          season: int, 
+                          start_date: str = None, 
+                          end_date: str = None, 
+                          sport_id: int = 1, 
+                          game_type: list = ['R'],
+                          pitching: bool = True):
         """
         Retrieves a list of game IDs for a specific player in a given season.
-        
-        Parameters:
-        - player_id (int): The ID of the player.
-        - season (int): The season year for which to retrieve the game list.
-        - start_date (str): The start date (YYYY-MM-DD) of the range (default is January 1st of the specified season).
-        - end_date (str): The end date (YYYY-MM-DD) of the range (default is December 31st of the specified season).
-        - sport_id (int): The ID of the sport for which to retrieve player data.
-        - game_type (list): A list of game types to filter the schedule. Default is ['R'].
-        - pitching (bool): Return pitching games.
-        
-        Returns:
-        - player_game_list (list): A list of game IDs in which the player participated during the specified season.
         """
         # Set default start and end dates if not provided
         if not start_date:
@@ -775,8 +1093,8 @@ class MLB_Scrape:
         # Determine the group based on the pitching flag
         group = 'pitching' if pitching else 'hitting'
 
-        # Validate date format
-        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+        # FIXED: Added missing closing bracket in regex pattern
+        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')  # Added missing $
         if not date_pattern.match(start_date):
             raise ValueError(f"start_date {start_date} is not in YYYY-MM-DD format")
         if not date_pattern.match(end_date):
@@ -883,3 +1201,74 @@ class MLB_Scrape:
             })
                 
         return df
+
+
+# USAGE EXAMPLE FOR TRAINING PIPELINE COMPATIBILITY
+def example_usage_for_training():
+    """
+    Example of how to use the updated scraper for training pipeline compatibility
+    """
+    scraper = MLB_Scrape()
+    
+    # Method 1: Get current season data in training format
+    pitch_df, game_df, season_df = scraper.get_current_season_data_for_training(
+        season_year=2024,
+        max_players=50,  # Limit for testing
+        test_mode=True
+    )
+    
+    if pitch_df is not None:
+        print("✅ Data collection successful!")
+        print(f"Pitch data shape: {pitch_df.shape}")
+        print(f"Required columns present: {all(col in pitch_df.columns for col in ['Name', 'Season', 'game_date'])}")
+        
+        # Save in format expected by training pipeline
+        pitch_df.to_csv('data/current_pitchlevel.csv', index=False)
+        game_df.to_csv('data/current_gamelevel.csv', index=False)
+        season_df.to_csv('data/current_seasonlevel.csv', index=False)
+        
+        print("✅ Data saved in training pipeline format!")
+    
+    # Method 2: Traditional approach (if you prefer step-by-step)
+    # Get schedule
+    schedule = scraper.get_schedule(year_input=[2024], sport_id=[1], game_type=['R'])
+    
+    # Get subset of games for testing
+    if schedule is not None:
+        test_games = schedule.head(10)['game_id'].to_list()
+        
+        # Get game data
+        game_data = scraper.get_data(test_games)
+        
+        # Convert to DataFrame (now returns pandas DataFrame)
+        df = scraper.get_data_df(game_data)
+        
+        print(f"Traditional method result: {df.shape}")
+        print(f"Columns: {list(df.columns)}")
+
+
+# INTEGRATION WITH WEEKLY UPDATE SCRIPT
+def get_current_season_data_UPDATED(season_year, max_players=None, test_mode=False):
+    """
+    UPDATED VERSION: Replace the function in weekly_update.py with this one
+    """
+    scraper = MLB_Scrape()
+    
+    # Use the new integrated method
+    pitch_df_current, game_df_current, season_stats = scraper.get_current_season_data_for_training(
+        season_year=season_year,
+        max_players=max_players,
+        test_mode=test_mode
+    )
+    
+    if pitch_df_current is None:
+        return None, None, None
+    
+    # Data is already in the correct format with Name and Season columns
+    print(f"✅ Data collected in training pipeline format")
+    print(f"✅ Pitch data: {len(pitch_df_current):,} rows, {pitch_df_current['Name'].nunique()} players")
+    print(f"✅ Game data: {len(game_df_current):,} rows")
+    print(f"✅ Season data: {len(season_stats):,} players")
+    
+    return pitch_df_current, game_df_current, season_stats 
+

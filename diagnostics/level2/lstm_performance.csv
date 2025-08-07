@@ -1,0 +1,2 @@
+train_mse,train_mae,train_r2,val_mse,val_mae,val_r2,best_params
+0.008884806313210694,0.06955387621131888,-0.004268261851473332,0.0094229787134386,0.07355763542765734,-0.002207982646822204,"{'units': 64, 'dropout': 0.30000000000000004, 'recurrent_dropout': 0.1, 'return_sequences': True, 'dense_units': 32, 'dense_activation': 'tanh', 'dense_dropout': 0.1, 'lr': 0.004587537316039295, 'beta_1': 0.85, 'beta_2': 0.995, 'final_dropout': 0.4, 'units2': 16, 'dropout2': 0.1}"

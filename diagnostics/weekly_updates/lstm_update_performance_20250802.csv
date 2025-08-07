@@ -1,0 +1,2 @@
+update_date,n_sequences,batch_size,epochs_run,pre_update_mse,post_update_mse,pre_update_mae,post_update_mae,mse_improvement,mae_improvement,prediction_change_mean,prediction_change_std
+20250802,1049,32,10,0.007567745775320703,0.007536247432406437,0.06497204613087482,0.0649639381790997,3.149834291426602e-05,8.107951775110367e-06,0.00050877105,0.0028598018

@@ -1,0 +1,2 @@
+accuracy,auc,best_params,cv_mean_score,n_features_selected,class_balance_ratio,n_samples
+0.9393939393939394,0.5,"{'clf__C': 0.001, 'clf__penalty': 'l1', 'selector__k': 3}",,3,0.06451612903225806,66

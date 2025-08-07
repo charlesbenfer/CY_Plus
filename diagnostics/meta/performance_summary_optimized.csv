@@ -1,0 +1,2 @@
+accuracy,auc,best_params,cv_strategy,cv_mean_score,n_features_used,class_balance_ratio,n_samples,optimization_applied,expected_improvement
+0.5606060606060606,0.7540322580645161,"{'clf__C': 1.0, 'clf__penalty': 'l1'}",5-Fold Stratified,,4,0.06451612903225806,66,True,AUC should be > 0.6 vs previous 0.5
